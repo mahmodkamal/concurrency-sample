@@ -1,0 +1,114 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"sync"
+
+	"cloud.google.com/go/firestore"
+	firebase "firebase.google.com/go/v4"
+	"google.golang.org/api/option"
+)
+
+var counter = 0
+var mutex sync.Mutex
+
+// Struct to represent an update operation
+type updateOperation struct {
+	index int
+	data  map[string]interface{}
+}
+
+func firestoreOperation(_ context.Context, i int, updateQueue chan<- updateOperation, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	// Prepare the update operation
+	update := updateOperation{
+		index: i,
+		data: map[string]interface{}{
+			"count": i,
+		},
+	}
+
+	// Queue the update operation
+	updateQueue <- update
+}
+
+func processUpdatesSequentially(ctx context.Context, client *firestore.Client, updateQueue <-chan updateOperation) {
+	for update := range updateQueue {
+		docRef := client.Collection("test").Doc("9amFLocVwHFNEaskVVda")
+
+		// Perform the update in sequence
+		_, err := docRef.Set(ctx, update.data)
+		if err != nil {
+			log.Printf("Error updating document for request %d: %v", update.index, err)
+			continue
+		}
+
+		log.Printf("Successfully updated document for request %d", update.index)
+
+		mutex.Lock()
+		counter++
+		mutex.Unlock()
+	}
+}
+
+func main() {
+	ctx := context.Background()
+
+	// Initialize Firebase app with credentials
+	opt := option.WithCredentialsFile("./key.json")
+	conf := &firebase.Config{
+		DatabaseURL: "https://bidding-a0571.firebaseio.com",
+	}
+
+	app, err := firebase.NewApp(ctx, conf, opt)
+	if err != nil {
+		log.Fatalf("Error initializing app: %v", err)
+	}
+
+	// Get Firestore client
+	client, err := app.Firestore(ctx)
+	if err != nil {
+		log.Fatalf("Error getting database client: %v", err)
+	}
+	defer client.Close() // Ensure client is closed when done
+
+	numRequests := 100
+	expectedCounter := numRequests
+
+	// Channel to queue update operations
+	updateQueue := make(chan updateOperation, numRequests)
+
+	var wg sync.WaitGroup
+
+	// Firestore operations to queue updates
+	for i := 0; i < numRequests; i++ {
+		wg.Add(1)
+		go firestoreOperation(ctx, i, updateQueue, &wg)
+	}
+
+	// Start a goroutine to process the update queue sequentially
+	go func() {
+		wg.Wait()          // Wait for all operations to be enqueued
+		close(updateQueue) // Close the channel once all operations are enqueued
+	}()
+
+	// Process updates sequentially
+	processUpdatesSequentially(ctx, client, updateQueue)
+
+	// All updates are processed after this point
+
+	fmt.Println("Expected Counter:", expectedCounter)
+	fmt.Println("Actual Counter:", counter)
+
+	// Check for race condition
+	if expectedCounter != counter {
+		fmt.Println("Race condition detected!")
+	} else {
+		fmt.Println("No race condition detected.")
+	}
+
+	fmt.Println("All requests completed")
+}
